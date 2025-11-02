@@ -400,13 +400,13 @@ async def on_message(message):
             # Apply timeout if 3 warnings reached
             if bad_word_warnings[message.author.id]["timeouts"] >= 3:
                 try:
-                    # Timeout for 10 minutes (600 seconds)
-                    await message.author.timeout(timedelta(minutes=10), reason="Exceeded bad word warnings 3 times")
+                    # Timeout for 6 hours
+                    await message.author.timeout(timedelta(hours=6), reason="Exceeded bad word warnings 3 times")
                     
                     # Notify in warning channel
                     if warning_channel:
                         await warning_channel.send(
-                            f"🔇 **{message.author.mention} has been timed out for 10 minutes** (3 warnings reached)"
+                            f"🔇 **{message.author.mention} has been timed out for 6 hours** (3 warnings reached)"
                         )
                     
                     # DM the user
