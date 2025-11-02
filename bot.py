@@ -1126,17 +1126,29 @@ async def contest_leaderboard(ctx):
                     print(f"DEBUG: Awarding role to {winner['member'].name}...")
                     await winner['member'].add_roles(winner_role, reason=f"Won competition: {active_competition}")
                     print("DEBUG: Role awarded!")
-                    embed.set_footer(text=f"🎊 {winner['member'].name} has been awarded the Contest Winner role!")
+                    winner_message = f"🎊 {winner['member'].name} has been awarded the Contest Winner role!"
                 else:
                     print(f"DEBUG: {winner['member'].name} already has the role")
-                    embed.set_footer(text=f"🏆 {winner['member'].name} is the current winner!")
+                    winner_message = f"🏆 {winner['member'].name} is the current winner!"
+                
+                # Set footer showing found/total participants
+                found_count = len(team_results)
+                total_count = len(contest_participants)
+                if found_count < total_count:
+                    missing_count = total_count - found_count
+                    embed.set_footer(text=f"{winner_message}\nShowing {found_count}/{total_count} participants • {missing_count} not found on leaderboard")
+                else:
+                    embed.set_footer(text=f"{winner_message}\nAll {total_count} participants found!")
         else:
-            embed.add_field(name="No Results", value="No registered participants found on the leaderboard yet.", inline=False)
+            embed.add_field(
+                name="No Results", 
+                value="No registered participants found on the leaderboard yet.\n"
+                      "Make sure to submit your solution on Kaggle first!", 
+                inline=False
+            )
+            embed.set_footer(text=f"Total Registered: {len(contest_participants)} • Try !my_kaggle to verify your username")
         
         await loading_msg.delete()
-        
-        # Set footer with participant count
-        embed.set_footer(text=f"Total Participants: {len(contest_participants)}")
         
         # Send to leaderboard channel
         leaderboard_channel = ctx.guild.get_channel(LEADERBOARD_CHANNEL_ID) if LEADERBOARD_CHANNEL_ID else ctx.channel
