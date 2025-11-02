@@ -1,0 +1,18 @@
+# Environment variables (contains secrets)
+.env
+
+# Python virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Data files (user-specific)
+kaggle_ids.json
+contest_participants.json
+discord.log
+
+# OS files
+.DS_Store
