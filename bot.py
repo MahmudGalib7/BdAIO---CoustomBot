@@ -115,45 +115,27 @@ def contains_bad_word(text):
     # First normalize the text (handles @, $, 3, etc. substitutions)
     normalized = normalize_text(text)
     
-    # Check normalized version
+    # Check normalized version with word boundaries
     for bad_word in BAD_WORDS:
         if bad_word in normalized:
             pattern = r'\b' + re.escape(bad_word) + r'\b'
             if re.search(pattern, normalized):
                 return True
     
-    # Also check for obfuscated versions (f#ck, f**k, etc.)
-    # Strategy: Check if text matches pattern where special chars replace letters
-    text_lower = text.lower()
-    for bad_word in BAD_WORDS:
-        if len(bad_word) >= 3:
-            # Create pattern: first letter + any chars + last letter
-            # and check if length is similar
-            first_char = bad_word[0]
-            last_char = bad_word[-1]
-            
-            # Pattern that matches first letter, anything in between, last letter
-            # e.g., for "fuck": f.{0,4}k (allowing some variation in length)
-            max_len = len(bad_word) + 3  # Allow some extra chars
-            min_len = len(bad_word) - 2  # Allow some missing chars
-            if min_len < 1:
-                min_len = 0
-            
-            pattern = rf'\b{re.escape(first_char)}.{{{min_len},{max_len}}}{re.escape(last_char)}\b'
-            
-            # If pattern matches, verify it's likely the bad word by checking middle letters
-            match = re.search(pattern, text_lower)
-            if match:
-                matched_text = match.group()
-                # Remove all non-letters
-                letters_only = re.sub(r'[^a-z]', '', matched_text)
-                # Check if remaining letters are subset of bad word letters
-                bad_word_letters = set(bad_word)
-                matched_letters = set(letters_only)
-                
-                # If at least 50% of bad word letters are present, OR first+last match, flag it
-                common_letters = len(matched_letters & bad_word_letters)
-                if common_letters >= len(bad_word) * 0.5 or (first_char in matched_letters and last_char in matched_letters):
+    # Simple obfuscation check: f**k, f@ck, etc.
+    # Only check if special characters are present
+    if re.search(r'[^a-zA-Z\s]', text):
+        text_lower = text.lower()
+        for bad_word in BAD_WORDS:
+            if len(bad_word) >= 4:  # Only for longer words
+                # Create a pattern where special chars can replace letters
+                # But require at least 60% of the original letters to be present
+                pattern_chars = []
+                for char in bad_word:
+                    # Allow this letter OR a special character
+                    pattern_chars.append(f'[{char}*@#$%!0-9]')
+                pattern = r'\b' + ''.join(pattern_chars) + r'\b'
+                if re.search(pattern, text_lower):
                     return True
     
     return False
@@ -228,6 +210,7 @@ async def on_message(message):
                         await message.author.send(
                             f"✅ **Registration Confirmed!**\n\n"
                             f"Kaggle ID: **{kaggle_id}**\n"
+                            f"You'll receive the competition link once registration closes!\n"
                             f"Good luck in the contest! 🚀"
                         )
                         
@@ -264,6 +247,7 @@ async def on_message(message):
                             f"✅ **Registration Confirmed!**\n\n"
                             f"Kaggle ID: **{kaggle_id}**\n"
                             f"Your Kaggle ID has been saved for future contests.\n\n"
+                            f"You'll receive the competition link once registration closes!\n\n"
                             f"💡 **Tip:** Use `!my_kaggle <new_id>` anytime to update your Kaggle ID.\n\n"
                             f"Good luck in the contest! 🚀"
                         )
@@ -291,6 +275,7 @@ async def on_message(message):
                             f"✅ **Registration Confirmed!**\n\n"
                             f"Kaggle ID: **{kaggle_id}**\n"
                             f"Your Kaggle ID has been saved for future contests.\n\n"
+                            f"You'll receive the competition link once registration closes!\n\n"
                             f"💡 **Tip:** Use `!my_kaggle <new_id>` anytime to update your Kaggle ID.\n\n"
                             f"Good luck in the contest! 🚀"
                         )
@@ -562,6 +547,11 @@ async def on_reaction_remove(reaction, user):
 @bot.event
 async def on_command_error(ctx, error):
     """Handle command errors"""
+    print(f"DEBUG: Command error occurred!")
+    print(f"DEBUG: Command: {ctx.message.content}")
+    print(f"DEBUG: Error type: {type(error).__name__}")
+    print(f"DEBUG: Error: {error}")
+    
     if isinstance(error, commands.MissingPermissions):
         print(f"DEBUG: Permission denied for {ctx.author.name} - {error}")
         embed = discord.Embed(
@@ -594,13 +584,16 @@ async def on_command_error(ctx, error):
 
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def create_contest(ctx, duration_hours: int, *, question):
+async def create_contest(ctx, duration_hours: float, *, question):
     """Create a poll for weekly contests with a time limit
     
     Usage: !create_contest <hours> <question>
     Example: !create_contest 48 Who wants to join this week's ML challenge?
+    Example: !create_contest 0.1 Quick 6-minute test poll
     """
     print(f"DEBUG: create_contest called by {ctx.author.name}")
+    print(f"DEBUG: duration_hours = {duration_hours}")
+    print(f"DEBUG: question = '{question}'")
     await ctx.message.delete()  # Delete the command message
     print(f"DEBUG: Message deleted, creating poll...")
     
@@ -951,14 +944,25 @@ async def help_command(ctx):
 
 # ===== KAGGLE FEATURES =====
 
-@bot.command()
+@bot.command(name='set_competition')
 @commands.has_permissions(administrator=True)
 async def set_competition(ctx, *, competition_id: str):
     """Set the active Kaggle competition to track
     
     Usage: !set_competition digit-recognizer
     """
-    await ctx.message.delete()
+    print("=" * 60)
+    print(f"DEBUG: set_competition CALLED by {ctx.author.name}")
+    print(f"DEBUG: Competition ID = '{competition_id}'")
+    print("=" * 60)
+    
+    try:
+        await ctx.message.delete()
+        print("DEBUG: Command message deleted")
+    except discord.errors.Forbidden:
+        print("Warning: Bot lacks 'Manage Messages' permission to delete command")
+    except Exception as e:
+        print(f"Warning: Could not delete command message: {e}")
     
     global active_competition, competition_end_time
     
@@ -1002,6 +1006,41 @@ async def set_competition(ctx, *, competition_id: str):
         embed.add_field(name="Competition ID", value=active_competition, inline=False)
         embed.add_field(name="Deadline", value=deadline_str, inline=False)
         embed.add_field(name="URL", value=f"https://www.kaggle.com/c/{active_competition}", inline=False)
+        
+        # DM all registered participants with the competition link
+        dm_count = 0
+        dm_failed = 0
+        
+        if contest_participants:
+            embed.add_field(
+                name="📨 Sending Links",
+                value=f"DMing competition link to {len(contest_participants)} registered participant(s)...",
+                inline=False
+            )
+            
+            for user_id, data in contest_participants.items():
+                try:
+                    user = await bot.fetch_user(int(user_id))
+                    await user.send(
+                        f"🎯 **Competition is Live!**\n\n"
+                        f"**{comp_title}**\n\n"
+                        f"🔗 **Link:** https://www.kaggle.com/c/{active_competition}\n"
+                        f"⏰ **Deadline:** {deadline_str}\n\n"
+                        f"Your registered Kaggle ID: **{data['kaggle_id']}**\n\n"
+                        f"Good luck! 🚀"
+                    )
+                    dm_count += 1
+                    print(f"DEBUG: Sent competition link to {data['name']}")
+                except Exception as dm_error:
+                    print(f"Warning: Could not DM user {user_id}: {dm_error}")
+                    dm_failed += 1
+            
+            embed.add_field(
+                name="✅ Links Sent",
+                value=f"Successfully sent to {dm_count} participant(s)" + (f" • {dm_failed} failed" if dm_failed > 0 else ""),
+                inline=False
+            )
+        
         embed.set_footer(text="Use !contest_leaderboard to view rankings")
         
         await loading_msg.delete()
@@ -1033,6 +1072,10 @@ async def contest_leaderboard(ctx):
         # Get the competition leaderboard from Kaggle
         leaderboard = kaggle_api.competition_leaderboard_view(active_competition)
         
+        print(f"DEBUG: First 3 leaderboard entries:")
+        for i, entry in enumerate(leaderboard[:3]):
+            print(f"  Position {i}: teamName={entry.team_name}, rank={getattr(entry, 'rank', 'N/A')}, score={entry.score}")
+        
         # Create a dict of Kaggle IDs from our participants
         participant_kaggle_ids = {data["kaggle_id"]: user_id for user_id, data in contest_participants.items()}
         
@@ -1049,6 +1092,9 @@ async def contest_leaderboard(ctx):
         for rank, entry in enumerate(leaderboard, 1):
             team_name = entry.team_name or ""
             normalized_team = re.sub(r"[^0-9a-zA-Z]", "", team_name).lower()
+            
+            # Use actual rank from Kaggle entry if available
+            actual_rank = getattr(entry, 'rank', rank)
 
             # Check if this team matches any of our participants
             for kaggle_id, user_id in participant_kaggle_ids.items():
@@ -1058,14 +1104,14 @@ async def contest_leaderboard(ctx):
                     continue
 
                 if normalized_kaggle in normalized_team or normalized_team in normalized_kaggle:
-                    print(f"DEBUG: MATCH FOUND! Rank {rank}: '{team_name}' matches '{kaggle_id}'")
+                    print(f"DEBUG: MATCH FOUND! Position {rank}, Actual Rank {actual_rank}: '{team_name}' matches '{kaggle_id}'")
                     member = ctx.guild.get_member(user_id)
                     if member:
                         print(f"DEBUG: Member found: {member.name}")
                         team_results.append({
                             'member': member,
                             'kaggle_id': kaggle_id,
-                            'rank': rank,
+                            'rank': actual_rank,
                             'score': entry.score
                         })
                     else:
