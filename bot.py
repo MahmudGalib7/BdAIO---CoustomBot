@@ -9,20 +9,23 @@ import json
 import asyncio
 import random
 import re
-from kaggle.api.kaggle_api_extended import KaggleApi
 
-# Load environment variables
+# Load environment variables FIRST
 load_dotenv()
+
+# Set Kaggle credentials in environment BEFORE importing KaggleApi
+os.environ['KAGGLE_USERNAME'] = os.getenv('KAGGLE_USERNAME', '')
+os.environ['KAGGLE_KEY'] = os.getenv('KAGGLE_KEY', '')
+
+# NOW import and initialize Kaggle API
+from kaggle.api.kaggle_api_extended import KaggleApi
+kaggle_api = KaggleApi()
+kaggle_api.authenticate()
+
 token = os.getenv('DISCORD_TOKEN')
 WARNING_CHANNEL_ID = int(os.getenv('WARNING_CHANNEL_ID', '0'))  # Set this in .env
 LEADERBOARD_CHANNEL_ID = int(os.getenv('LEADERBOARD_CHANNEL_ID', '0'))  # Set this in .env for contest leaderboard
 STATS_CHANNEL_ID = int(os.getenv('STATS_CHANNEL_ID', '0'))  # Set this in .env for daily server stats
-
-# Initialize Kaggle API with credentials from .env
-kaggle_api = KaggleApi()
-os.environ['KAGGLE_USERNAME'] = os.getenv('KAGGLE_USERNAME', '')
-os.environ['KAGGLE_KEY'] = os.getenv('KAGGLE_KEY', '')
-kaggle_api.authenticate()
 
 # Setup logging
 handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w')
