@@ -26,6 +26,7 @@ token = os.getenv('DISCORD_TOKEN')
 WARNING_CHANNEL_ID = int(os.getenv('WARNING_CHANNEL_ID', '0'))  # Set this in .env
 LEADERBOARD_CHANNEL_ID = int(os.getenv('LEADERBOARD_CHANNEL_ID', '0'))  # Set this in .env for contest leaderboard
 STATS_CHANNEL_ID = int(os.getenv('STATS_CHANNEL_ID', '0'))  # Set this in .env for daily server stats
+TIPS_CHANNEL_ID = int(os.getenv('TIPS_CHANNEL_ID', '0'))  # Set this in .env for tips/motivation messages
 
 # Setup logging
 handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w')
@@ -52,35 +53,31 @@ bad_word_warnings = defaultdict(lambda: {"count": 0, "messages": [], "timeouts":
 
 # Bad words list (customize as needed)
 BAD_WORDS = [
-    # Profanity (including variations with special chars)
-    'shit', 'fuck', 'damn', 'bitch', 'ass', 'hell', 'crap', 'bastard', 'piss',
+    # Profanity (strong language)
+    'shit', 'fuck', 'bitch', 'bastard', 'piss',
     'cock', 'dick', 'pussy', 'cunt', 'twat', 'bollocks', 'wanker', 'asshole',
     'motherfucker', 'fuckface', 'shithead', 'dickhead', 'dumbass', 'jackass',
     'bullshit', 'horseshit', 'bitchass', 'dipshit', 'shitty', 'fucking',
-    'fucked', 'fucker', 'fucks', 'arse', 'arsehole', 'bloody hell',
-    'son of a bitch', 'what the fuck', 'what the hell', 'go to hell',
-    'piece of shit', 'full of shit', 'eat shit', 'holy shit',
-    
-    # Slurs and offensive terms (racial/ethnic)
+    'fucked', 'fucker', 'fucks', 'arse', 'arsehole',
+    'son of a bitch', 'piece of shit', 'full of shit', 'eat shit', 'holy shit',
+
+    # Slurs and hate speech (racial/ethnic)
     'nigger', 'nigga', 'chink', 'gook', 'spic', 'kike', 'wetback', 'beaner',
     'towelhead', 'raghead', 'cracker', 'honky', 'paki', 'jap', 'injun',
-    
+
     # Sexual/inappropriate
-    'porn', 'hentai', 'nude', 'sex', 'rape', 'whore', 'slut', 'hoe',
+    'porn', 'hentai', 'rape', 'whore', 'slut', 'hoe',
     'milf', 'dildo', 'boobs', 'tits', 'titties', 'penis', 'vagina',
-    
+
     # Homophobic/transphobic
-    'fag', 'faggot', 'dyke', 'queer', 'homo', 'tranny', 'shemale',
-    
+    'fag', 'faggot', 'dyke', 'tranny', 'shemale',
+
     # Ableist
-    'retard', 'retarded', 'autistic', 'downy', 'spaz', 'cripple', 'midget',
-    
-    # Religious offense
-    'goddamn', 'jesus christ', 'christ', 'jehova',
-    
-    # Other offensive
+    'retard', 'retarded', 'downy', 'spaz', 'cripple', 'midget',
+
+    # Other offensive or harmful
     'nazi', 'hitler', 'pedo', 'pedophile', 'kill yourself', 'kys',
-    'nsfw', 'cancer', 'aids'
+    'nsfw'
 ]
 
 # Bad word detection settings
@@ -1396,9 +1393,13 @@ async def motivation_and_tips():
     all_messages = tips + inspirations
     
     for guild in bot.guilds:
-        channel = discord.utils.get(guild.text_channels, name="general")
-        if not channel:
-            channel = guild.text_channels[0] if guild.text_channels else None
+        # Use configured TIPS_CHANNEL_ID, fallback to searching for "general" or first channel
+        if TIPS_CHANNEL_ID:
+            channel = bot.get_channel(TIPS_CHANNEL_ID)
+        else:
+            channel = discord.utils.get(guild.text_channels, name="general")
+            if not channel:
+                channel = guild.text_channels[0] if guild.text_channels else None
         
         if channel:
             message = random.choice(all_messages)
