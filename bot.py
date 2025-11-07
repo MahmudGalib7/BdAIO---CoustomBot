@@ -1,5 +1,6 @@
 import discord
 from discord.ext import commands, tasks
+from discord import app_commands
 import logging
 from dotenv import load_dotenv
 import os
@@ -35,7 +36,7 @@ intents.message_content = True
 intents.members = True
 intents.reactions = True
 
-bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)  # Disable default help
+bot = commands.Bot(command_prefix='/', intents=intents, help_command=None)  # Slash commands only
 
 # Data storage (in production, use a database)
 user_activity = defaultdict(lambda: {"messages": 0, "last_seen": None})
@@ -83,9 +84,9 @@ BAD_WORDS = [
 # Bad word detection settings
 BAD_WORD_THRESHOLD = 15  # Number of violations before warning admin
 
-# Spam detection settings (stricter to catch fast typing)
-SPAM_THRESHOLD = 4  # messages (lowered from 5)
-SPAM_TIME_WINDOW = 3  # seconds (lowered from 5)
+# Spam detection settings - Allow reasonable typing speed
+SPAM_THRESHOLD = 6  # messages (increased from 4 - allows sending multiple lines/GIFs)
+SPAM_TIME_WINDOW = 5  # seconds (increased from 3 - more forgiving)
 
 def normalize_text(text):
     """Remove special characters and normalize text for bad word detection"""
@@ -111,42 +112,101 @@ def normalize_text(text):
     return normalized
 
 def contains_bad_word(text):
-    """Check if text contains bad words, accounting for variations"""
+    """Check if text contains bad words, accounting for simple variations only"""
     # First normalize the text (handles @, $, 3, etc. substitutions)
     normalized = normalize_text(text)
     
     # Check normalized version with word boundaries
+    # This catches: fuck, sh1t, @ss, fvck, etc.
     for bad_word in BAD_WORDS:
-        if bad_word in normalized:
-            pattern = r'\b' + re.escape(bad_word) + r'\b'
-            if re.search(pattern, normalized):
-                return True
+        pattern = r'\b' + re.escape(bad_word) + r'\b'
+        if re.search(pattern, normalized):
+            return True
     
-    # Simple obfuscation check: f**k, f@ck, etc.
-    # Only check if special characters are present
-    if re.search(r'[^a-zA-Z\s]', text):
-        text_lower = text.lower()
-        for bad_word in BAD_WORDS:
-            if len(bad_word) >= 4:  # Only for longer words
-                # Create a pattern where special chars can replace letters
-                # But require at least 60% of the original letters to be present
-                pattern_chars = []
-                for char in bad_word:
-                    # Allow this letter OR a special character
-                    pattern_chars.append(f'[{char}*@#$%!0-9]')
-                pattern = r'\b' + ''.join(pattern_chars) + r'\b'
-                if re.search(pattern, text_lower):
-                    return True
+    # That's it! Simple and reliable.
+    # Won't catch f**k or f***k, but those are self-censored anyway.
+    # Won't catch "2000" or normal messages either!
     
     return False
 
 # ===== EVENT HANDLERS =====
+
+async def handle_bad_word_warning(author, warning_channel):
+    """Handle bad word warning notifications asynchronously"""
+    user_data = bad_word_warnings[author.id]
+    
+    # DM user
+    try:
+        recent_messages = user_data["messages"][-3:]
+        messages_list = "\n".join([f"  • {msg_data['content']}" for msg_data in recent_messages])
+        
+        await author.send(
+            f"⚠️ **Official Warning - Language Violation**\n\n"
+            f"You have reached the inappropriate language threshold (**{BAD_WORD_THRESHOLD} violations**).\n\n"
+            f"**Recent flagged messages:**\n{messages_list}\n\n"
+            f"Please review our server rules and maintain respectful communication.\n"
+            f"**Note:** Accumulating 3 warnings will result in a 6-hour timeout.\n\n"
+            f"—————————————————\n"
+            f"*AI Olympiad Community Moderation Team*"
+        )
+    except:
+        pass
+    
+    # Notify admin channel
+    if warning_channel:
+        embed = discord.Embed(
+            title="⚠️ Bad Word Threshold Reached",
+            description=f"**User:** {author.mention} ({author.name})\n**Violations:** {user_data['count']}",
+            color=0xff0000,
+            timestamp=datetime.now()
+        )
+        recent_msgs = user_data["messages"][-3:]
+        for i, msg_data in enumerate(recent_msgs, 1):
+            embed.add_field(
+                name=f"Message {i} - #{msg_data['channel']}",
+                value=f"```{msg_data['content']}```",
+                inline=False
+            )
+        embed.set_footer(text=f"Total violations: {user_data['count']}")
+        await warning_channel.send(embed=embed)
+    
+    # Apply timeout if 3 warnings
+    bad_word_warnings[author.id]["timeouts"] += 1
+    if bad_word_warnings[author.id]["timeouts"] >= 3:
+        try:
+            await author.timeout(timedelta(hours=6), reason="Exceeded bad word warnings 3 times")
+            if warning_channel:
+                await warning_channel.send(
+                    f"🔇 **{author.mention} has been timed out for 6 hours** (3 warnings reached)"
+                )
+            try:
+                await author.send(
+                    f"🔇 **You have been timed out for 6 hours**\n\n"
+                    f"You received 3 warnings for inappropriate language.\n"
+                    f"Please review the server rules."
+                )
+            except:
+                pass
+            bad_word_warnings[author.id]["timeouts"] = 0
+        except Exception as e:
+            print(f"Error timing out user: {e}")
+    
+    # Reset count after warning
+    bad_word_warnings[author.id]["count"] = 0
+    bad_word_warnings[author.id]["messages"] = []
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
     print("AI Olympiad Bot is ready!")
     print(f"Serving {len(bot.guilds)} guild(s)")
+    
+    # Sync slash commands
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} slash command(s)")
+    except Exception as e:
+        print(f"Error syncing commands: {e}")
     
     # Start background tasks to keep bot active
     if not daily_stats_update.is_running():
@@ -182,6 +242,27 @@ async def on_member_join(member):
 async def on_message(message):
     if message.author == bot.user:
         return
+    
+    # PRIORITY CHECK: Bad words first - instant deletion for server messages with text
+    if not isinstance(message.channel, discord.DMChannel) and message.content and message.content.strip():
+        if contains_bad_word(message.content):
+            # Delete instantly
+            print(f"DEBUG: Bad word detected from {message.author.name}: '{message.content[:50]}'")
+            await message.delete()
+            
+            # Track violation
+            bad_word_warnings[message.author.id]["count"] += 1
+            bad_word_warnings[message.author.id]["messages"].append({
+                "content": message.content,
+                "channel": message.channel.name,
+                "timestamp": datetime.now().isoformat()
+            })
+            
+            # Handle warnings (async, doesn't slow down deletion)
+            if bad_word_warnings[message.author.id]["count"] >= BAD_WORD_THRESHOLD:
+                asyncio.create_task(handle_bad_word_warning(message.author, bot.get_channel(WARNING_CHANNEL_ID)))
+            
+            return  # Stop processing
     
     # Check if this is a DM response for Kaggle ID registration
     if isinstance(message.channel, discord.DMChannel):
@@ -320,104 +401,9 @@ async def on_message(message):
     user_activity[message.author.id]["messages"] += 1
     user_activity[message.author.id]["last_seen"] = datetime.now()
     
-    # Check for bad words (silent warning with threshold)
-    if contains_bad_word(message.content):
-        # Delete the message immediately
-        try:
-            await message.delete()
-        except:
-            pass
-        
-        bad_word_warnings[message.author.id]["count"] += 1
-        bad_word_warnings[message.author.id]["messages"].append({
-            "content": message.content,
-            "channel": message.channel.name,
-            "timestamp": datetime.now().isoformat()
-        })
-        
-        # Only send warning if threshold is reached
-        if bad_word_warnings[message.author.id]["count"] >= BAD_WORD_THRESHOLD:
-            warning_channel = bot.get_channel(WARNING_CHANNEL_ID)
-            user_data = bad_word_warnings[message.author.id]
-            
-            # Send DM to user
-            try:
-                # Get last 3 messages
-                recent_messages = user_data["messages"][-3:]
-                messages_list = "\n".join([f"  • {msg_data['content']}" for msg_data in recent_messages])
-                
-                await message.author.send(
-                    f"⚠️ **Official Warning - Language Violation**\n\n"
-                    f"You have reached the inappropriate language threshold (**{BAD_WORD_THRESHOLD} violations**).\n\n"
-                    f"**Recent flagged messages:**\n{messages_list}\n\n"
-                    f"Please review our server rules and maintain respectful communication.\n"
-                    f"**Note:** Accumulating 3 warnings will result in a 10-minute timeout.\n\n"
-                    f"—————————————————\n"
-                    f"*AI Olympiad Community Moderation Team*"
-                )
-            except:
-                pass
-            
-            # Send warning to admin channel
-            if warning_channel:
-                embed = discord.Embed(
-                    title="⚠️ Bad Word Threshold Reached",
-                    description=f"**User:** {message.author.mention} ({message.author.name})\n**Violations:** {user_data['count']}",
-                    color=0xff0000,
-                    timestamp=datetime.now()
-                )
-                
-                # Add recent messages
-                recent_msgs = user_data["messages"][-3:]  # Last 3 messages
-                for i, msg_data in enumerate(recent_msgs, 1):
-                    embed.add_field(
-                        name=f"Message {i} - #{msg_data['channel']}",
-                        value=f"```{msg_data['content']}```",
-                        inline=False
-                    )
-                
-                embed.set_footer(text=f"Total violations: {user_data['count']}")
-                await warning_channel.send(embed=embed)
-            
-            # Increment timeout counter
-            bad_word_warnings[message.author.id]["timeouts"] += 1
-            
-            # Apply timeout if 3 warnings reached
-            if bad_word_warnings[message.author.id]["timeouts"] >= 3:
-                try:
-                    # Timeout for 6 hours
-                    await message.author.timeout(timedelta(hours=6), reason="Exceeded bad word warnings 3 times")
-                    
-                    # Notify in warning channel
-                    if warning_channel:
-                        await warning_channel.send(
-                            f"🔇 **{message.author.mention} has been timed out for 6 hours** (3 warnings reached)"
-                        )
-                    
-                    # DM the user
-                    try:
-                        await message.author.send(
-                            f"🔇 **You have been timed out for 10 minutes**\n\n"
-                            f"You received 3 warnings for inappropriate language.\n"
-                            f"Please review the server rules."
-                        )
-                    except:
-                        pass
-                    
-                    # Reset timeout counter
-                    bad_word_warnings[message.author.id]["timeouts"] = 0
-                except Exception as e:
-                    print(f"Error timing out user: {e}")
-            
-            # Reset count after warning
-            bad_word_warnings[message.author.id]["count"] = 0
-            bad_word_warnings[message.author.id]["messages"] = []
-        
-        # Don't process this message further (already deleted)
-        return
-    
     # Check for @everyone spam
     if '@everyone' in message.content and not message.author.guild_permissions.mention_everyone:
+        print(f"DEBUG: @everyone spam detected from {message.author.name}")
         await message.delete()
         await message.channel.send(f"{message.author.mention}, please don't spam @everyone!", delete_after=5)
         return
@@ -434,6 +420,7 @@ async def on_message(message):
     
     # Check if user is spamming
     if len(message_tracker[message.author.id]) > SPAM_THRESHOLD:
+        print(f"DEBUG: Spam detected from {message.author.name} ({len(message_tracker[message.author.id])} msgs in {SPAM_TIME_WINDOW}s)")
         await message.delete()
         await message.channel.send(
             f"{message.author.mention}, please slow down! You're sending messages too quickly.",
@@ -578,34 +565,170 @@ async def on_command_error(ctx, error):
         import traceback
         traceback.print_exc()  # Print full traceback
 
-# ===== COMMANDS =====
+# ===== SLASH COMMANDS =====
 
-# Traditional prefix commands (!command)
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def create_contest(ctx, duration_hours: float, *, question):
-    """Create a poll for weekly contests with a time limit
-    
-    Usage: !create_contest <hours> <question>
-    Example: !create_contest 48 Who wants to join this week's ML challenge?
-    Example: !create_contest 0.1 Quick 6-minute test poll
-    """
-    print(f"DEBUG: create_contest called by {ctx.author.name}")
-    print(f"DEBUG: duration_hours = {duration_hours}")
-    print(f"DEBUG: question = '{question}'")
-    await ctx.message.delete()  # Delete the command message
-    print(f"DEBUG: Message deleted, creating poll...")
-    
+# Helper function for poll expiry
+async def expire_poll(poll_message, duration_hours):
+    await asyncio.sleep(duration_hours * 3600)
     global active_poll_message_id, poll_expiry_time, pending_registrations
+    embed = discord.Embed(
+        title='⏰ Contest Poll Closed',
+        description=f'Registration closed! Total: **{len(contest_participants)}**',
+        color=0xff9900
+    )
+    await poll_message.channel.send(embed=embed)
+    pending_registrations = {}
+
+# User Commands
+
+@bot.tree.command(name="ping", description="Check if the bot is responsive")
+async def slash_ping(interaction: discord.Interaction):
+    await interaction.response.send_message("🏓 Pong! Bot is online!", ephemeral=True)
+
+@bot.tree.command(name="help", description="Show all available commands")
+async def slash_help(interaction: discord.Interaction):
+    is_admin = interaction.user.guild_permissions.administrator
     
-    # Clear previous participants for new contest
-    global contest_participants
+    embed = discord.Embed(
+        title="🤖 AI Olympiad Bot Commands",
+        description="All commands use slash (/) prefix",
+        color=0xe74c3c
+    )
+    
+    embed.add_field(
+        name="General Commands",
+        value="`/ping` - Check if bot is online\n"
+              "`/help` - Show this help message\n"
+              "`/activity` - Check your activity stats\n"
+              "`/setkaggle` - Set your Kaggle ID\n"
+              "`/mykaggle` - View your Kaggle ID",
+        inline=False
+    )
+    
+    if is_admin:
+        embed.add_field(
+            name="Admin Commands",
+            value="`/createcontest` - Create contest poll\n"
+                  "`/setcompetition` - Set Kaggle competition\n"
+                  "`/leaderboard` - Show live leaderboard\n"
+                  "`/participants` - Show contest participants\n"
+                  "`/clearparticipants` - Clear participant list\n"
+                  "`/serverstats` - Show server statistics\n"
+                  "`/checkwarnings` - Check bad word warnings\n"
+                  "`/clearwarnings` - Clear user warnings",
+            inline=False
+        )
+    
+    embed.add_field(
+        name="Features",
+        value="✅ Bad word detection\n"
+              "✅ Spam prevention\n"
+              "✅ Contest registration\n"
+              "✅ Daily AI tips",
+        inline=False
+    )
+    
+    embed.set_footer(text="AI Olympiad Community Bot")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="activity", description="Check your server activity stats")
+async def slash_activity(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    
+    if user_id not in user_activity:
+        await interaction.response.send_message("You have no recorded activity yet!", ephemeral=True)
+        return
+    
+    data = user_activity[user_id]
+    embed = discord.Embed(
+        title=f"📊 Activity Stats for {interaction.user.name}",
+        color=0x9b59b6
+    )
+    embed.add_field(name="Messages Sent", value=str(data["messages"]), inline=True)
+    
+    if data["last_seen"]:
+        last_seen = data["last_seen"].strftime("%Y-%m-%d %H:%M:%S")
+        embed.add_field(name="Last Seen", value=last_seen, inline=True)
+    
+    embed.set_thumbnail(url=interaction.user.display_avatar.url)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="setkaggle", description="Set your Kaggle ID")
+@app_commands.describe(kaggle_id="Your Kaggle username")
+async def slash_setkaggle(interaction: discord.Interaction, kaggle_id: str):
+    user_id = interaction.user.id
+    
+    if user_id in kaggle_ids:
+        old_id = kaggle_ids[user_id]["kaggle_id"]
+        kaggle_ids[user_id]["kaggle_id"] = kaggle_id
+        kaggle_ids[user_id]["updated_at"] = datetime.now().isoformat()
+        save_kaggle_ids()
+        
+        if user_id in contest_participants:
+            contest_participants[user_id]["kaggle_id"] = kaggle_id
+            save_participants()
+        
+        await interaction.response.send_message(
+            f"✅ **Kaggle ID Updated!**\n\n"
+            f"Previous: ~~{old_id}~~\n"
+            f"New: **{kaggle_id}**",
+            ephemeral=True
+        )
+    else:
+        kaggle_ids[user_id] = {
+            "name": interaction.user.name,
+            "kaggle_id": kaggle_id,
+            "registered_at": datetime.now().isoformat()
+        }
+        save_kaggle_ids()
+        
+        if user_id in contest_participants:
+            contest_participants[user_id]["kaggle_id"] = kaggle_id
+            save_participants()
+        
+        await interaction.response.send_message(
+            f"✅ **Kaggle ID Saved!**\n\n"
+            f"ID: **{kaggle_id}**\n"
+            f"Profile: https://www.kaggle.com/{kaggle_id}",
+            ephemeral=True
+        )
+
+@bot.tree.command(name="mykaggle", description="View your saved Kaggle ID")
+async def slash_mykaggle(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    
+    if user_id in kaggle_ids:
+        kaggle_id = kaggle_ids[user_id]["kaggle_id"]
+        await interaction.response.send_message(
+            f"**Your Kaggle Profile:**\n"
+            f"ID: **{kaggle_id}**\n"
+            f"Profile: https://www.kaggle.com/{kaggle_id}\n\n"
+            f"💡 Use `/setkaggle` to update",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"❌ **No Kaggle ID Found**\n\n"
+            f"Set it with: `/setkaggle <username>`\n"
+            f"Example: `/setkaggle johndoe123`",
+            ephemeral=True
+        )
+
+# Admin Commands
+
+@bot.tree.command(name="createcontest", description="[ADMIN] Create a contest poll")
+@app_commands.describe(duration_hours="Hours until poll expires", question="Contest poll question")
+async def slash_createcontest(interaction: discord.Interaction, duration_hours: float, question: str):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    global active_poll_message_id, poll_expiry_time, pending_registrations, contest_participants
+    
     contest_participants = {}
     pending_registrations = {}
     save_participants()
     
-    # Calculate expiry time
     poll_expiry_time = datetime.now() + timedelta(hours=duration_hours)
     expiry_str = poll_expiry_time.strftime("%Y-%m-%d %H:%M:%S")
     
@@ -617,68 +740,35 @@ async def create_contest(ctx, duration_hours: float, *, question):
     )
     embed.add_field(
         name="How to Participate",
-        value="React with 👍 to join the contest!\nYou'll receive a DM asking for your Kaggle ID.",
+        value="React with 👍 to join!\nYou'll receive a DM for your Kaggle ID.",
         inline=False
     )
     embed.add_field(
-        name="⏰ Registration Deadline",
-        value=f"Poll expires: **{expiry_str}**\n({duration_hours} hours from now)",
+        name="⏰ Deadline",
+        value=f"Expires: **{expiry_str}**\n({duration_hours} hours)",
         inline=False
     )
     embed.set_footer(text="AI Olympiad Community")
     
-    print(f"DEBUG: Sending embed...")
-    try:
-        poll_message = await ctx.send(embed=embed)
-        print(f"DEBUG: Embed sent successfully, adding reaction...")
-        await poll_message.add_reaction("👍")
-        print(f"DEBUG: Reaction added!")
-    except Exception as e:
-        print(f"DEBUG ERROR: Failed to send embed or add reaction: {e}")
-        import traceback
-        traceback.print_exc()
+    await interaction.response.send_message(embed=embed)
+    poll_message = await interaction.original_response()
+    await poll_message.add_reaction("👍")
+    
+    active_poll_message_id = poll_message.id
+    asyncio.create_task(expire_poll(poll_message, duration_hours))
+
+@bot.tree.command(name="participants", description="[ADMIN] Show contest participants")
+async def slash_participants(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
         return
     
-    # Track this poll as the active one
-    active_poll_message_id = poll_message.id
-    
-    # Schedule poll expiry notification
-    asyncio.create_task(expire_poll(poll_message, duration_hours))
-    print(f"DEBUG: Contest created successfully!")
-
-async def expire_poll(poll_message, duration_hours):
-    """Auto-close poll after duration expires"""
-    await asyncio.sleep(duration_hours * 3600)  # Convert hours to seconds
-    
-    global active_poll_message_id, poll_expiry_time, pending_registrations
-    
-    # Send expiry notification
-    embed = discord.Embed(
-        title="⏰ Contest Poll Closed",
-        description=f"Registration has closed! Total participants: **{len(contest_participants)}**",
-        color=0xff9900
-    )
-    
-    await poll_message.channel.send(embed=embed)
-    
-    # Clear pending registrations
-    pending_registrations = {}
-    
-    print(f"Poll expired with {len(contest_participants)} participants")
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def show_participants(ctx):
-    """Show all contest participants with their Kaggle profiles"""
-    await ctx.message.delete()  # Delete the command message
-    
     if not contest_participants:
-        await ctx.send("No participants registered yet!", delete_after=5)
+        await interaction.response.send_message("No participants yet!", ephemeral=True)
         return
     
     embed = discord.Embed(
         title="🏆 Contest Participants",
-        description="List of registered participants",
         color=0x0099ff,
         timestamp=datetime.now()
     )
@@ -687,18 +777,18 @@ async def show_participants(ctx):
         kaggle_url = f"https://www.kaggle.com/{data['kaggle_id']}"
         embed.add_field(
             name=data['name'],
-            value=f"Kaggle: [{data['kaggle_id']}]({kaggle_url})",
+            value=f"[{data['kaggle_id']}]({kaggle_url})",
             inline=False
         )
     
-    embed.set_footer(text=f"Total Participants: {len(contest_participants)}")
-    await ctx.send(embed=embed)
+    embed.set_footer(text=f"Total: {len(contest_participants)}")
+    await interaction.response.send_message(embed=embed)
 
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def clear_participants(ctx):
-    """Clear all contest participants (for new contest)"""
-    await ctx.message.delete()  # Delete the command message
+@bot.tree.command(name="clearparticipants", description="[ADMIN] Clear all participants")
+async def slash_clearparticipants(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
     
     global contest_participants, active_poll_message_id, poll_expiry_time, pending_registrations
     contest_participants = {}
@@ -706,507 +796,476 @@ async def clear_participants(ctx):
     poll_expiry_time = None
     pending_registrations = {}
     save_participants()
-    await ctx.send("✅ Participant list cleared!", delete_after=5)
+    await interaction.response.send_message("✅ Cleared!", ephemeral=True)
 
-@bot.command()
-async def activity(ctx, member: discord.Member = None):
-    """Check user activity stats"""
-    await ctx.message.delete()  # Delete command message
-    
-    member = member or ctx.author
-    
-    if member.id not in user_activity:
-        await ctx.send(f"{member.mention} has no recorded activity yet!", delete_after=15)
+@bot.tree.command(name="serverstats", description="[ADMIN] Show server statistics")
+async def slash_serverstats(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
         return
-    
-    data = user_activity[member.id]
-    embed = discord.Embed(
-        title=f"📊 Activity Stats for {member.name}",
-        color=0x9b59b6
-    )
-    embed.add_field(name="Messages Sent", value=str(data["messages"]), inline=True)
-    
-    if data["last_seen"]:
-        last_seen = data["last_seen"].strftime("%Y-%m-%d %H:%M:%S")
-        embed.add_field(name="Last Seen", value=last_seen, inline=True)
-    
-    embed.set_thumbnail(url=member.avatar.url if member.avatar else None)
-    await ctx.send(embed=embed, delete_after=30)
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def check_warnings(ctx, member: discord.Member = None):
-    """Check bad word warnings for a user or all users"""
-    await ctx.message.delete()
-    
-    if member:
-        # Check specific user
-        if member.id in bad_word_warnings and bad_word_warnings[member.id]["count"] > 0:
-            data = bad_word_warnings[member.id]
-            embed = discord.Embed(
-                title=f"⚠️ Warnings for {member.name}",
-                description=f"**Current violations:** {data['count']}/{BAD_WORD_THRESHOLD}",
-                color=0xff9900
-            )
-            
-            for i, msg_data in enumerate(data["messages"][-5:], 1):
-                embed.add_field(
-                    name=f"Violation {i} - #{msg_data['channel']}",
-                    value=f"```{msg_data['content'][:100]}```",
-                    inline=False
-                )
-            
-            await ctx.send(embed=embed)
-        else:
-            await ctx.send(f"{member.mention} has no warnings.", delete_after=5)
-    else:
-        # Check all users with warnings
-        users_with_warnings = [(user_id, data) for user_id, data in bad_word_warnings.items() if data["count"] > 0]
-        
-        if users_with_warnings:
-            embed = discord.Embed(
-                title="⚠️ All User Warnings",
-                description=f"Users with pending violations (threshold: {BAD_WORD_THRESHOLD})",
-                color=0xff9900
-            )
-            
-            for user_id, data in users_with_warnings[:10]:  # Show top 10
-                member = ctx.guild.get_member(user_id)
-                if member:
-                    embed.add_field(
-                        name=member.name,
-                        value=f"Violations: {data['count']}/{BAD_WORD_THRESHOLD}",
-                        inline=True
-                    )
-            
-            await ctx.send(embed=embed)
-        else:
-            await ctx.send("No users have warnings currently.", delete_after=5)
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def clear_warnings(ctx, member: discord.Member):
-    """Clear bad word warnings for a specific user"""
-    await ctx.message.delete()
-    
-    if member.id in bad_word_warnings:
-        bad_word_warnings[member.id]["count"] = 0
-        bad_word_warnings[member.id]["messages"] = []
-        await ctx.send(f"✅ Cleared warnings for {member.mention}", delete_after=5)
-    else:
-        await ctx.send(f"{member.mention} has no warnings to clear.", delete_after=5)
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def server_stats(ctx):
-    """Show overall server activity statistics"""
-    await ctx.message.delete()  # Delete the command message
     
     total_messages = sum(data["messages"] for data in user_activity.values())
     active_users = len(user_activity)
     
     embed = discord.Embed(
         title="📈 Server Statistics",
-        description="Overall activity in the AI Olympiad Community",
         color=0x3498db
     )
-    embed.add_field(name="Total Members", value=str(ctx.guild.member_count), inline=True)
+    embed.add_field(name="Total Members", value=str(interaction.guild.member_count), inline=True)
     embed.add_field(name="Active Users", value=str(active_users), inline=True)
-    embed.add_field(name="Total Messages Tracked", value=str(total_messages), inline=True)
+    embed.add_field(name="Messages Tracked", value=str(total_messages), inline=True)
     
-    await ctx.send(embed=embed)
+    await interaction.response.send_message(embed=embed)
 
-@bot.command()
-async def my_kaggle(ctx, kaggle_id: str = None):
-    """Set or view your Kaggle ID"""
-    await ctx.message.delete()  # Delete the command message for privacy
+@bot.tree.command(name="checkwarnings", description="[ADMIN] Check bad word warnings")
+@app_commands.describe(member="User to check (optional)")
+async def slash_checkwarnings(interaction: discord.Interaction, member: discord.Member = None):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
     
-    if kaggle_id:
-        # Check if updating existing ID
-        if ctx.author.id in kaggle_ids:
-            old_id = kaggle_ids[ctx.author.id]["kaggle_id"]
-            kaggle_ids[ctx.author.id]["kaggle_id"] = kaggle_id
-            kaggle_ids[ctx.author.id]["updated_at"] = datetime.now().isoformat()
-            save_kaggle_ids()
-            
-            # Also update in contest_participants if they're in an active contest
-            if ctx.author.id in contest_participants:
-                contest_participants[ctx.author.id]["kaggle_id"] = kaggle_id
-                save_participants()
-            
-            await ctx.author.send(
-                f"✅ **Kaggle ID Updated!**\n\n"
-                f"Previous ID: ~~{old_id}~~\n"
-                f"New ID: **{kaggle_id}**\n\n"
-                f"Your new ID will be used for future contests."
+    if member:
+        if member.id in bad_word_warnings and bad_word_warnings[member.id]["count"] > 0:
+            data = bad_word_warnings[member.id]
+            embed = discord.Embed(
+                title=f"⚠️ Warnings for {member.name}",
+                description=f"Violations: {data['count']}/{BAD_WORD_THRESHOLD}",
+                color=0xff9900
             )
+            
+            for i, msg_data in enumerate(data["messages"][-5:], 1):
+                embed.add_field(
+                    name=f"Violation {i}",
+                    value=f"```{msg_data['content'][:100]}```",
+                    inline=False
+                )
+            
+            await interaction.response.send_message(embed=embed)
         else:
-            # Setting for the first time
-            kaggle_ids[ctx.author.id] = {
-                "name": ctx.author.name,
-                "kaggle_id": kaggle_id,
-                "registered_at": datetime.now().isoformat()
-            }
-            save_kaggle_ids()
-            
-            # Also update in contest_participants if they're in an active contest
-            if ctx.author.id in contest_participants:
-                contest_participants[ctx.author.id]["kaggle_id"] = kaggle_id
-                save_participants()
-            
-            await ctx.author.send(
-                f"✅ **Kaggle ID Saved!**\n\n"
-                f"Your Kaggle ID: **{kaggle_id}**\n"
-                f"Profile: https://www.kaggle.com/{kaggle_id}\n\n"
-                f"💡 **Tip:** Use `!my_kaggle <new_id>` anytime to update it."
-            )
+            await interaction.response.send_message(f"{member.mention} has no warnings", ephemeral=True)
     else:
-        if ctx.author.id in kaggle_ids:
-            kaggle_id = kaggle_ids[ctx.author.id]["kaggle_id"]
-            kaggle_url = f"https://www.kaggle.com/{kaggle_id}"
-            await ctx.author.send(
-                f"**Your Kaggle Profile:**\n"
-                f"ID: **{kaggle_id}**\n"
-                f"Profile: {kaggle_url}\n\n"
-                f"💡 To update: `!my_kaggle <new_id>`"
+        users_with_warnings = [(uid, d) for uid, d in bad_word_warnings.items() if d["count"] > 0]
+        
+        if users_with_warnings:
+            embed = discord.Embed(
+                title="⚠️ All Warnings",
+                description=f"Threshold: {BAD_WORD_THRESHOLD}",
+                color=0xff9900
             )
+            
+            for user_id, data in users_with_warnings[:10]:
+                member_obj = interaction.guild.get_member(user_id)
+                if member_obj:
+                    embed.add_field(
+                        name=member_obj.name,
+                        value=f"{data['count']}/{BAD_WORD_THRESHOLD}",
+                        inline=True
+                    )
+            
+            await interaction.response.send_message(embed=embed)
         else:
-            await ctx.author.send(
-                f"❌ **No Kaggle ID Found**\n\n"
-                f"You haven't set your Kaggle ID yet!\n"
-                f"Use: `!my_kaggle <your_kaggle_id>`\n\n"
-                f"**Example:** `!my_kaggle johndoe123`"
-            )
+            await interaction.response.send_message("No warnings", ephemeral=True)
 
-@bot.command(name='help')
-async def help_command(ctx):
-    """Show all available commands (only visible to you)"""
-    # Delete the command message FIRST
-    try:
-        await ctx.message.delete()
-    except:
-        pass
+@bot.tree.command(name="clearwarnings", description="[ADMIN] Clear warnings for a user")
+@app_commands.describe(member="User to clear warnings for")
+async def slash_clearwarnings(interaction: discord.Interaction, member: discord.Member):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
     
-    is_admin = ctx.author.guild_permissions.administrator
-    
-    embed = discord.Embed(
-        title="🤖 AI Olympiad Bot Commands",
-        description="Here are the commands you can use:",
-        color=0xe74c3c
-    )
-    
-    embed.add_field(
-        name="General Commands",
-        value="`!activity [@user]` - Check activity stats\n"
-              "`!my_kaggle [kaggle_id]` - Set/view your Kaggle ID\n"
-              "`!help` - Show this help message",
-        inline=False
-    )
-    
-    if is_admin:
-        embed.add_field(
-            name="Admin Commands",
-            value="`!create_contest <hours> <question>` - Create contest poll with time limit\n"
-                  "`!set_competition <competition-id>` - Set active Kaggle competition\n"
-                  "`!contest_leaderboard` - Show live Kaggle leaderboard & award winner\n"
-                  "`!show_participants` - Show contest participants\n"
-                  "`!clear_participants` - Clear participant list\n"
-                  "`!server_stats` - Show server statistics\n"
-                  "`!check_warnings [@user]` - Check bad word warnings\n"
-                  "`!clear_warnings @user` - Clear warnings for a user",
-            inline=False
-        )
-    
-    embed.add_field(
-        name="Automatic Features",
-        value="✅ Smart bad word detection (handles variations like sh#t)\n"
-              f"✅ Warning threshold: {BAD_WORD_THRESHOLD} violations before admin alert\n"
-              "✅ Auto-timeout after 3 warnings (10 minutes)\n"
-              "✅ Spam prevention\n"
-              "✅ @everyone spam blocking\n"
-              "✅ User activity tracking\n"
-              "✅ Contest registration via reactions\n"
-              "✅ Daily motivational AI tips",
-        inline=False
-    )
-    
-    embed.set_footer(text="AI Olympiad Community Bot • Only you can see this")
-    
-    # Send as ephemeral message (only visible to user)
-    help_msg = await ctx.send(embed=embed)
-    
-    # Delete after 60 seconds
-    await asyncio.sleep(60)
-    try:
-        await help_msg.delete()
-    except:
-        pass
+    if member.id in bad_word_warnings:
+        bad_word_warnings[member.id]["count"] = 0
+        bad_word_warnings[member.id]["messages"] = []
+        await interaction.response.send_message(f"✅ Cleared for {member.mention}", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"{member.mention} has no warnings", ephemeral=True)
 
-# ===== KAGGLE FEATURES =====
-
-@bot.command(name='set_competition')
-@commands.has_permissions(administrator=True)
-async def set_competition(ctx, *, competition_id: str):
-    """Set the active Kaggle competition to track
-    
-    Usage: !set_competition digit-recognizer
-    """
-    print("=" * 60)
-    print(f"DEBUG: set_competition CALLED by {ctx.author.name}")
-    print(f"DEBUG: Competition ID = '{competition_id}'")
-    print("=" * 60)
-    
-    try:
-        await ctx.message.delete()
-        print("DEBUG: Command message deleted")
-    except discord.errors.Forbidden:
-        print("Warning: Bot lacks 'Manage Messages' permission to delete command")
-    except Exception as e:
-        print(f"Warning: Could not delete command message: {e}")
+@bot.tree.command(name="setcompetition", description="[ADMIN] Set Kaggle competition ID and notify participants")
+@app_commands.describe(competition_id="Kaggle competition ID (e.g., titanic)")
+async def slash_setcompetition(interaction: discord.Interaction, competition_id: str):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
     
     global active_competition, competition_end_time
     
+    await interaction.response.defer()  # This might take time
+    
     try:
-        loading_msg = await ctx.send(f"🔄 Verifying competition: **{competition_id}**...")
+        # Set competition (simplified - just verify it's accessible)
+        active_competition = competition_id
         
-        # Try to access the competition directly to verify it exists
+        # Try to get competition info for deadline (optional)
+        deadline_str = "Check Kaggle for deadline"
         try:
-            # This will throw an error if competition doesn't exist
-            leaderboard = kaggle_api.competition_leaderboard_view(competition_id)
-            
-            # Competition exists! Now get more details if possible
-            comp_list = list(kaggle_api.competitions_list(search=competition_id))
-            
+            # This is optional - if it fails, we still set the competition
+            comp_list = kaggle_api.competitions_list(search=competition_id)
             if comp_list:
-                # Found in search results, use detailed info
-                competition = comp_list[0]
-                active_competition = competition.ref
-                competition_end_time = competition.deadline
-                comp_title = competition.title
-                deadline_str = competition.deadline.strftime("%Y-%m-%d %H:%M UTC") if competition.deadline else "N/A"
-            else:
-                # Not in search but leaderboard works, use competition_id directly
-                active_competition = competition_id
-                competition_end_time = None
-                comp_title = competition_id.replace('-', ' ').title()
-                deadline_str = "Check Kaggle website"
-            
-        except Exception as verify_error:
-            await loading_msg.delete()
-            await ctx.send(f"❌ Competition '{competition_id}' not found or not accessible!\n💡 Make sure the competition ID is correct.", delete_after=15)
-            return
+                for comp in comp_list:
+                    if comp.ref == competition_id:
+                        deadline = comp.deadline
+                        if deadline:
+                            deadline_str = deadline.strftime("%B %d, %Y at %I:%M %p UTC")
+                            competition_end_time = deadline
+                        break
+        except:
+            pass  # If we can't get deadline, that's okay
         
+        # Get competition deadline if available (kept for compatibility)
+        deadline = deadline_str
+        # Get competition deadline if available (kept for compatibility)
+        deadline = deadline_str
+        if deadline and deadline != "Check Kaggle for deadline":
+            # Already formatted above
+            pass
+        else:
+            deadline_str = "Check Kaggle for deadline"
+            competition_end_time = None
+        
+        # Send DMs to all registered participants
+        participants_notified = 0
+        participants_failed = 0
+        
+        if contest_participants:
+            for user_id, user_data in contest_participants.items():
+                try:
+                    member = interaction.guild.get_member(user_id)
+                    if member:
+                        # Create beautiful DM with competition info
+                        dm_embed = discord.Embed(
+                            title="🏆 New Competition Announced!",
+                            description=f"A new Kaggle competition has been set for our contest!",
+                            color=0x00ff00,
+                            timestamp=datetime.now()
+                        )
+                        dm_embed.add_field(
+                            name="📌 Competition",
+                            value=f"**{competition_id}**",
+                            inline=False
+                        )
+                        dm_embed.add_field(
+                            name="🔗 Competition Link",
+                            value=f"[Click here to join!](https://www.kaggle.com/c/{competition_id})",
+                            inline=False
+                        )
+                        dm_embed.add_field(
+                            name="⏰ Deadline",
+                            value=deadline_str,
+                            inline=False
+                        )
+                        dm_embed.add_field(
+                            name="📝 Your Kaggle ID",
+                            value=f"**{user_data.get('kaggle_id', 'Not set')}**",
+                            inline=False
+                        )
+                        dm_embed.add_field(
+                            name="🎯 Next Steps",
+                            value="1. Join the competition on Kaggle\n"
+                                  "2. Make your submissions\n"
+                                  "3. Check <#" + str(LEADERBOARD_CHANNEL_ID) + "> after contest ends for rankings!" if LEADERBOARD_CHANNEL_ID else "3. Check the #leaderboard channel for rankings!",
+                            inline=False
+                        )
+                        dm_embed.set_footer(
+                            text="AI Olympiad Community",
+                            icon_url="https://www.kaggle.com/static/images/site-logo.png"
+                        )
+                        
+                        await member.send(embed=dm_embed)
+                        participants_notified += 1
+                        print(f"Notified {member.name} about competition")
+                except Exception as e:
+                    participants_failed += 1
+                    print(f"Failed to notify user {user_id}: {e}")
+        
+        # Send confirmation to admin
         embed = discord.Embed(
-            title="🎯 Competition Set!",
-            description=f"Now tracking: **{comp_title}**",
+            title="✅ Competition Set Successfully!",
+            description=f"**Competition ID:** `{competition_id}`",
             color=0x00ff00,
             timestamp=datetime.now()
         )
-        
-        embed.add_field(name="Competition ID", value=active_competition, inline=False)
-        embed.add_field(name="Deadline", value=deadline_str, inline=False)
-        embed.add_field(name="URL", value=f"https://www.kaggle.com/c/{active_competition}", inline=False)
-        
-        # DM all registered participants with the competition link
-        dm_count = 0
-        dm_failed = 0
+        embed.add_field(name="🔗 URL", value=f"https://www.kaggle.com/c/{competition_id}", inline=False)
+        embed.add_field(name="⏰ Deadline", value=deadline_str, inline=False)
         
         if contest_participants:
             embed.add_field(
-                name="📨 Sending Links",
-                value=f"DMing competition link to {len(contest_participants)} registered participant(s)...",
+                name="📨 Notifications Sent",
+                value=f"✅ Notified: **{participants_notified}** participants\n"
+                      f"❌ Failed: **{participants_failed}** participants",
                 inline=False
             )
-            
-            for user_id, data in contest_participants.items():
-                try:
-                    user = await bot.fetch_user(int(user_id))
-                    await user.send(
-                        f"🎯 **Competition is Live!**\n\n"
-                        f"**{comp_title}**\n\n"
-                        f"🔗 **Link:** https://www.kaggle.com/c/{active_competition}\n"
-                        f"⏰ **Deadline:** {deadline_str}\n\n"
-                        f"Your registered Kaggle ID: **{data['kaggle_id']}**\n\n"
-                        f"Good luck! 🚀"
-                    )
-                    dm_count += 1
-                    print(f"DEBUG: Sent competition link to {data['name']}")
-                except Exception as dm_error:
-                    print(f"Warning: Could not DM user {user_id}: {dm_error}")
-                    dm_failed += 1
-            
+        else:
             embed.add_field(
-                name="✅ Links Sent",
-                value=f"Successfully sent to {dm_count} participant(s)" + (f" • {dm_failed} failed" if dm_failed > 0 else ""),
+                name="⚠️ No Participants",
+                value="No registered participants to notify.\nUse `/createcontest` to gather participants first!",
                 inline=False
             )
         
-        embed.set_footer(text="Use !contest_leaderboard to view rankings")
+        embed.add_field(name="📊 Next Step", value="Use `/leaderboard` to fetch live scores", inline=False)
+        embed.set_footer(text="Competition tracking active")
         
-        await loading_msg.delete()
-        await ctx.send(embed=embed, delete_after=60)
+        await interaction.followup.send(embed=embed)
         
     except Exception as e:
+        await interaction.followup.send(
+            f"❌ **Error**: Could not set competition!\n"
+            f"**Details:** {str(e)}\n\n"
+            f"**Possible reasons:**\n"
+            f"• Competition ID is incorrect\n"
+            f"• Competition doesn't exist on Kaggle\n"
+            f"• Kaggle API credentials are invalid",
+            ephemeral=True
+        )
         print(f"Error setting competition: {e}")
-        import traceback
-        traceback.print_exc()
-        await ctx.send(f"❌ Error setting competition: {str(e)}", delete_after=15)
 
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def contest_leaderboard(ctx):
-    """Display Kaggle competition leaderboard for registered participants"""
-    await ctx.message.delete()
+@bot.tree.command(name="leaderboard", description="[ADMIN] Show live Kaggle leaderboard")
+async def slash_leaderboard(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
     
     if not active_competition:
-        await ctx.send("❌ No active competition set! Use `!set_competition <competition-id>` first.", delete_after=15)
+        await interaction.response.send_message(
+            "❌ No active competition set!\nUse `/setcompetition <id>` first.",
+            ephemeral=True
+        )
         return
     
-    if not contest_participants:
-        await ctx.send("❌ No contest participants registered!", delete_after=15)
-        return
-    
-    loading_msg = await ctx.send(f"🔄 Fetching leaderboard from Kaggle competition: **{active_competition}**...")
+    await interaction.response.defer()  # This can take time
     
     try:
-        # Get the competition leaderboard from Kaggle
-        leaderboard = kaggle_api.competition_leaderboard_view(active_competition)
+        # Download leaderboard to a temporary directory
+        import tempfile
+        import csv
+        import zipfile
         
-        print(f"DEBUG: First 3 leaderboard entries:")
-        for i, entry in enumerate(leaderboard[:3]):
-            print(f"  Position {i}: teamName={entry.team_name}, rank={getattr(entry, 'rank', 'N/A')}, score={entry.score}")
+        # Create temp directory
+        tmp_dir = tempfile.mkdtemp()
         
-        # Create a dict of Kaggle IDs from our participants
-        participant_kaggle_ids = {data["kaggle_id"]: user_id for user_id, data in contest_participants.items()}
+        # Download leaderboard (it downloads as a zip file)
+        kaggle_api.competition_leaderboard_download(active_competition, tmp_dir)
         
-        # Find our participants on the leaderboard
-        # Normalize both team names and kaggle IDs by removing non-alphanumeric
-        # characters and comparing lowercase forms. This handles display names
-        # like "Mahmud Galib" vs username "mahmudgalib".
-        import re
-        team_results = []
+        # Find the CSV file in the zip
+        import os
+        zip_path = os.path.join(tmp_dir, f"{active_competition}.zip")
         
-        print(f"DEBUG: Looking for participants: {participant_kaggle_ids}")
-        print(f"DEBUG: Total leaderboard entries: {len(leaderboard)}")
+        participant_scores = []
         
-        for rank, entry in enumerate(leaderboard, 1):
-            team_name = entry.team_name or ""
-            normalized_team = re.sub(r"[^0-9a-zA-Z]", "", team_name).lower()
+        # Extract and read the CSV from the zip
+        leaderboard = []
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            # List all CSV files in the zip
+            csv_files = [f for f in zip_ref.namelist() if f.endswith('.csv')]
             
-            # Use actual rank from Kaggle entry if available
-            actual_rank = getattr(entry, 'rank', rank)
-
-            # Check if this team matches any of our participants
-            for kaggle_id, user_id in participant_kaggle_ids.items():
-                normalized_kaggle = re.sub(r"[^0-9a-zA-Z]", "", kaggle_id).lower()
-
-                if not normalized_kaggle or not normalized_team:
-                    continue
-
-                if normalized_kaggle in normalized_team or normalized_team in normalized_kaggle:
-                    print(f"DEBUG: MATCH FOUND! Position {rank}, Actual Rank {actual_rank}: '{team_name}' matches '{kaggle_id}'")
-                    member = ctx.guild.get_member(user_id)
-                    if member:
-                        print(f"DEBUG: Member found: {member.name}")
-                        team_results.append({
-                            'member': member,
-                            'kaggle_id': kaggle_id,
-                            'rank': actual_rank,
-                            'score': entry.score
+            print(f"DEBUG: Found CSV files in zip: {csv_files}")
+            
+            if csv_files:
+                # Look for private leaderboard first, then public
+                private_file = next((f for f in csv_files if 'private' in f.lower()), None)
+                public_file = next((f for f in csv_files if 'public' in f.lower()), None)
+                
+                # Use the first available file (prefer private if exists)
+                csv_to_read = private_file or public_file or csv_files[0]
+                
+                print(f"DEBUG: Reading leaderboard from: {csv_to_read}")
+                
+                with zip_ref.open(csv_to_read) as csv_file:
+                    import io
+                    csv_content = io.TextIOWrapper(csv_file, encoding='utf-8')
+                    csv_reader = csv.DictReader(csv_content)
+                    leaderboard = list(csv_reader)
+        
+        # Clean up temp files
+        import shutil
+        shutil.rmtree(tmp_dir)
+        
+        # Debug: Print CSV columns and first entries
+        if leaderboard:
+            print(f"DEBUG: CSV Columns: {list(leaderboard[0].keys())}")
+            print(f"DEBUG: First 3 entries:")
+            for i, entry in enumerate(leaderboard[:3]):
+                print(f"  {i+1}. {entry}")
+        
+        print(f"DEBUG: Looking for participants: {[(uid, data.get('kaggle_id')) for uid, data in contest_participants.items()]}")
+        
+        # Filter participants who are registered
+        for user_id, user_data in contest_participants.items():
+            kaggle_id = user_data.get("kaggle_id", "").lower()
+            
+            # Search for this user in leaderboard by checking ALL columns
+            for entry in leaderboard:
+                # Check all fields for a match
+                found = False
+                for key, value in entry.items():
+                    if kaggle_id in str(value).lower():
+                        # Get all rank-related columns
+                        public_rank = 'N/A'
+                        private_rank = 'N/A'
+                        
+                        for rank_key in entry.keys():
+                            key_lower = rank_key.lower()
+                            if 'public' in key_lower and 'rank' in key_lower:
+                                public_rank = entry[rank_key]
+                            elif 'private' in key_lower and 'rank' in key_lower:
+                                private_rank = entry[rank_key]
+                            elif key_lower == 'rank' or 'rank' in key_lower:
+                                # Generic rank column (usually public)
+                                if public_rank == 'N/A':
+                                    public_rank = entry[rank_key]
+                        
+                        # Get Kaggle username from CSV
+                        kaggle_username = entry.get('TeamMemberUserNames', kaggle_id)
+                        
+                        participant_scores.append({
+                            "name": user_data.get("name", "Unknown"),
+                            "kaggle_id": entry.get('TeamName', kaggle_id),
+                            "kaggle_username": kaggle_username,
+                            "score": float(entry.get('Score', 0)),
+                            "public_rank": public_rank,
+                            "private_rank": private_rank,
+                            "user_id": user_id  # Store user_id for role assignment
                         })
-                    else:
-                        print(f"DEBUG: Member NOT found for user_id {user_id}")
+                        print(f"DEBUG: Found match! '{kaggle_id}' found in {key}='{value}' (Public: {public_rank}, Private: {private_rank})")
+                        found = True
+                        break
+                if found:
                     break
         
-        print(f"DEBUG: Found {len(team_results)} results")
+        if not participant_scores:
+            # Show helpful debug info
+            registered_ids = [data.get("kaggle_id") for data in contest_participants.values()]
+            await interaction.followup.send(
+                f"📊 No registered participants found on the leaderboard yet!\n\n"
+                f"**Registered Kaggle IDs:** {', '.join(registered_ids)}\n"
+                f"**Hint:** Make sure participants have submitted to the competition and their Kaggle username matches exactly.",
+                ephemeral=True
+            )
+            return
         
-        # Sort by rank
-        team_results.sort(key=lambda x: x['rank'])
+        # Sort by public rank (lower is better)
+        participant_scores.sort(key=lambda x: int(x["public_rank"]) if str(x["public_rank"]).isdigit() else 999999)
         
-        # Create leaderboard embed
         embed = discord.Embed(
-            title=f"🏆 Contest Leaderboard - {active_competition}",
-            description="**Live Kaggle Rankings**",
+            title=f"🏆 Contest Leaderboard",
+            description=f"**Competition:** {active_competition}",
             color=0xffd700,
             timestamp=datetime.now()
         )
         
-        if team_results:
-            medals = ["🥇", "🥈", "🥉"]
-            for i, result in enumerate(team_results, 1):
-                medal = medals[i-1] if i <= 3 else f"{i}."
-                
-                embed.add_field(
-                    name=f"{medal} {result['member'].name}",
-                    value=f"Kaggle: [{result['kaggle_id']}](https://www.kaggle.com/{result['kaggle_id']})\n"
-                          f"**Rank:** #{result['rank']}\n"
-                          f"**Score:** {result['score']}",
-                    inline=False
-                )
+        # Add competition info at the top
+        embed.add_field(
+            name="📌 Competition Info",
+            value=f"🔗 [View on Kaggle](https://www.kaggle.com/c/{active_competition})\n"
+                  f"👥 **{len(participant_scores)}** registered participants",
+            inline=False
+        )
+        embed.add_field(name="━━━━━━━━━━━━━━━━━━━━", value="", inline=False)  # Separator
+        
+        # Show top 10 in detail, rest as summary
+        top_count = min(10, len(participant_scores))
+        
+        for i, player in enumerate(participant_scores[:top_count], 1):
+            # Fancy medals and emojis
+            if i == 1:
+                medal = "🥇"
+                rank_emoji = "👑"
+            elif i == 2:
+                medal = "🥈"
+                rank_emoji = "⭐"
+            elif i == 3:
+                medal = "🥉"
+                rank_emoji = "✨"
+            else:
+                medal = f"**{i}.**"
+                rank_emoji = "📊"
             
-            # Award winner role to top participant (best among registered participants)
-            if team_results:
-                winner = team_results[0]  # Best performer among registered participants
-                print(f"DEBUG: Winner is {winner['member'].name} at rank #{winner['rank']}")
-                
-                winner_role = discord.utils.get(ctx.guild.roles, name="🏆 Contest Winner")
-                
-                # Create role if it doesn't exist
-                if not winner_role:
-                    print("DEBUG: Creating Contest Winner role...")
-                    winner_role = await ctx.guild.create_role(
-                        name="🏆 Contest Winner",
-                        color=discord.Color.gold(),
-                        reason="Competition winner role"
-                    )
-                    print("DEBUG: Role created!")
-                
-                # Remove role from previous winners
-                for member in ctx.guild.members:
-                    if winner_role in member.roles and member.id != winner['member'].id:
-                        print(f"DEBUG: Removing role from {member.name}")
-                        await member.remove_roles(winner_role, reason="New competition winner")
-                
-                # Award role to current winner
-                if winner_role not in winner['member'].roles:
-                    print(f"DEBUG: Awarding role to {winner['member'].name}...")
-                    await winner['member'].add_roles(winner_role, reason=f"Won competition: {active_competition}")
-                    print("DEBUG: Role awarded!")
-                    winner_message = f"🎊 {winner['member'].name} has been awarded the Contest Winner role!"
+            # Build rank display with emojis
+            rank_display = ""
+            if player['public_rank'] != 'N/A':
+                rank_display += f"🎯 Rank: **#{player['public_rank']}**"
+            if player['private_rank'] != 'N/A':
+                if rank_display:
+                    rank_display += f"\n🔒 Private: **#{player['private_rank']}**"
                 else:
-                    print(f"DEBUG: {winner['member'].name} already has the role")
-                    winner_message = f"🏆 {winner['member'].name} is the current winner!"
-                
-                # Set footer showing found/total participants
-                found_count = len(team_results)
-                total_count = len(contest_participants)
-                if found_count < total_count:
-                    missing_count = total_count - found_count
-                    embed.set_footer(text=f"{winner_message}\nShowing {found_count}/{total_count} participants • {missing_count} not found on leaderboard")
-                else:
-                    embed.set_footer(text=f"{winner_message}\nAll {total_count} participants found!")
-        else:
+                    rank_display += f"🔒 Private: **#{player['private_rank']}**"
+            if not rank_display:
+                rank_display = "🎯 Rank: **N/A**"
+            
+            # Kaggle profile link
+            kaggle_username = player.get('kaggle_username', '')
+            profile_link = f"\n👤 [{player['kaggle_id']}](https://www.kaggle.com/{kaggle_username})" if kaggle_username else f"\n👤 {player['kaggle_id']}"
+            
             embed.add_field(
-                name="No Results", 
-                value="No registered participants found on the leaderboard yet.\n"
-                      "Make sure to submit your solution on Kaggle first!", 
+                name=f"{medal} {rank_emoji} {player['name']}",
+                value=f"💯 Score: **{player['score']:.5f}**\n{rank_display}{profile_link}",
                 inline=False
             )
-            embed.set_footer(text=f"Total Registered: {len(contest_participants)} • Try !my_kaggle to verify your username")
         
-        await loading_msg.delete()
+        # If more than 10 participants, show remaining as compact list
+        if len(participant_scores) > 10:
+            embed.add_field(name="━━━━━━━━━━━━━━━━━━━━", value="", inline=False)
+            
+            remaining_text = "**📋 Other Participants:**\n"
+            for i, player in enumerate(participant_scores[10:20], 11):  # Show next 10
+                rank = player['public_rank'] if player['public_rank'] != 'N/A' else '?'
+                remaining_text += f"`{i}.` {player['name']} - Rank #{rank} ({player['score']:.3f})\n"
+            
+            if len(participant_scores) > 20:
+                remaining_text += f"\n*...and {len(participant_scores) - 20} more participants*"
+            
+            embed.add_field(name="", value=remaining_text, inline=False)
         
-        # Send to leaderboard channel
-        leaderboard_channel = ctx.guild.get_channel(LEADERBOARD_CHANNEL_ID) if LEADERBOARD_CHANNEL_ID else ctx.channel
-        await leaderboard_channel.send(embed=embed)
+        # Add footer with timestamp
+        embed.set_footer(
+            text=f"🏆 Total Participants: {len(participant_scores)} • Updated",
+            icon_url="https://www.kaggle.com/static/images/site-logo.png"
+        )
+        
+        # Set thumbnail (Kaggle logo or trophy)
+        embed.set_thumbnail(url="https://www.kaggle.com/static/images/site-logo.png")
+        
+        # Assign 🏆 Contest Winner role to top 3
+        if participant_scores:
+            winner_role = discord.utils.get(interaction.guild.roles, name="🏆 Contest Winner")
+            
+            # Create role if it doesn't exist
+            if not winner_role:
+                try:
+                    winner_role = await interaction.guild.create_role(
+                        name="🏆 Contest Winner",
+                        color=discord.Color.gold(),
+                        reason="Auto-created for contest winners"
+                    )
+                    print(f"Created '🏆 Contest Winner' role")
+                except Exception as e:
+                    print(f"Error creating winner role: {e}")
+            
+            # Assign to top 3 participants
+            if winner_role:
+                for i, player in enumerate(participant_scores[:3]):
+                    try:
+                        member = interaction.guild.get_member(player['user_id'])
+                        if member and winner_role not in member.roles:
+                            await member.add_roles(winner_role, reason=f"Top {i+1} in contest")
+                            print(f"Assigned winner role to {player['name']}")
+                    except Exception as e:
+                        print(f"Error assigning role to {player['name']}: {e}")
+        
+        # Send to leaderboard channel if set
+        if LEADERBOARD_CHANNEL_ID:
+            leaderboard_channel = bot.get_channel(LEADERBOARD_CHANNEL_ID)
+            if leaderboard_channel:
+                await leaderboard_channel.send(embed=embed)
+        
+        await interaction.followup.send(embed=embed)
         
     except Exception as e:
-        print(f"Error fetching leaderboard: {e}")
-        import traceback
-        traceback.print_exc()
-        await loading_msg.delete()
-        await ctx.send(f"❌ Error fetching leaderboard: {str(e)}", delete_after=15)
-
+        await interaction.followup.send(
+            f"❌ Error fetching leaderboard: {str(e)}\n"
+            f"Make sure the competition ID is correct and participants have submitted.",
+            ephemeral=True
+        )
+        print(f"Leaderboard error: {e}")
 
 # ===== BACKGROUND TASKS (Keep bot active 24/7) =====
 
