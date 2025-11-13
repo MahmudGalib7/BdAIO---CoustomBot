@@ -8,7 +8,6 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 import json
 import asyncio
-import random
 import re
 
 # Load environment variables FIRST
@@ -27,7 +26,6 @@ token = os.getenv('DISCORD_TOKEN')
 WARNING_CHANNEL_ID = int(os.getenv('WARNING_CHANNEL_ID', '0'))  # Set this in .env
 LEADERBOARD_CHANNEL_ID = int(os.getenv('LEADERBOARD_CHANNEL_ID', '0'))  # Set this in .env for contest leaderboard
 STATS_CHANNEL_ID = int(os.getenv('STATS_CHANNEL_ID', '0'))  # Set this in .env for daily server stats
-TIPS_CHANNEL_ID = int(os.getenv('TIPS_CHANNEL_ID', '0'))  # Set this in .env for tips/motivation messages
 
 # Setup logging
 handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w')
@@ -40,7 +38,6 @@ bot = commands.Bot(command_prefix='/', intents=intents, help_command=None)  # Sl
 
 # Data storage (in production, use a database)
 user_activity = defaultdict(lambda: {"messages": 0, "last_seen": None})
-message_tracker = defaultdict(list)  # Track messages for spam detection
 kaggle_ids = {}  # Permanent storage: {user_id: {"name": str, "kaggle_id": str, "registered_at": str}}
 contest_participants = {}  # Temporary contest data: {user_id: {"name": str, "kaggle_id": str, "score": float, "confirmed": bool}}
 active_poll_message_id = None  # Track the current active poll
@@ -83,10 +80,7 @@ BAD_WORDS = [
 
 # Bad word detection settings
 BAD_WORD_THRESHOLD = 15  # Number of violations before warning admin
-
-# Spam detection settings - Allow reasonable typing speed
-SPAM_THRESHOLD = 6  # messages (increased from 4 - allows sending multiple lines/GIFs)
-SPAM_TIME_WINDOW = 5  # seconds (increased from 3 - more forgiving)
+BAD_WORD_WHITELIST = [int(id.strip()) for id in os.getenv('BAD_WORD_WHITELIST', '').split(',') if id.strip()]  # Channels to skip bad word detection
 
 def normalize_text(text):
     """Remove special characters and normalize text for bad word detection"""
@@ -211,8 +205,6 @@ async def on_ready():
     # Start background tasks to keep bot active
     if not daily_stats_update.is_running():
         daily_stats_update.start()
-    if not motivation_and_tips.is_running():
-        motivation_and_tips.start()
     
 @bot.event
 async def on_member_join(member):
@@ -245,24 +237,26 @@ async def on_message(message):
     
     # PRIORITY CHECK: Bad words first - instant deletion for server messages with text
     if not isinstance(message.channel, discord.DMChannel) and message.content and message.content.strip():
-        if contains_bad_word(message.content):
-            # Delete instantly
-            print(f"DEBUG: Bad word detected from {message.author.name}: '{message.content[:50]}'")
-            await message.delete()
-            
-            # Track violation
-            bad_word_warnings[message.author.id]["count"] += 1
-            bad_word_warnings[message.author.id]["messages"].append({
-                "content": message.content,
-                "channel": message.channel.name,
-                "timestamp": datetime.now().isoformat()
-            })
-            
-            # Handle warnings (async, doesn't slow down deletion)
-            if bad_word_warnings[message.author.id]["count"] >= BAD_WORD_THRESHOLD:
-                asyncio.create_task(handle_bad_word_warning(message.author, bot.get_channel(WARNING_CHANNEL_ID)))
-            
-            return  # Stop processing
+        # Skip bad word detection for whitelisted channels (e.g., music channels)
+        if message.channel.id not in BAD_WORD_WHITELIST:
+            if contains_bad_word(message.content):
+                # Delete instantly
+                print(f"DEBUG: Bad word detected from {message.author.name}: '{message.content[:50]}'")
+                await message.delete()
+                
+                # Track violation
+                bad_word_warnings[message.author.id]["count"] += 1
+                bad_word_warnings[message.author.id]["messages"].append({
+                    "content": message.content,
+                    "channel": message.channel.name,
+                    "timestamp": datetime.now().isoformat()
+                })
+
+                # Handle warnings (async, doesn't slow down deletion)
+                if bad_word_warnings[message.author.id]["count"] >= BAD_WORD_THRESHOLD:
+                    asyncio.create_task(handle_bad_word_warning(message.author, bot.get_channel(WARNING_CHANNEL_ID)))
+
+                return  # Stop processing
     
     # Check if this is a DM response for Kaggle ID registration
     if isinstance(message.channel, discord.DMChannel):
@@ -400,35 +394,6 @@ async def on_message(message):
     # Track user activity
     user_activity[message.author.id]["messages"] += 1
     user_activity[message.author.id]["last_seen"] = datetime.now()
-    
-    # Check for @everyone spam
-    if '@everyone' in message.content and not message.author.guild_permissions.mention_everyone:
-        print(f"DEBUG: @everyone spam detected from {message.author.name}")
-        await message.delete()
-        await message.channel.send(f"{message.author.mention}, please don't spam @everyone!", delete_after=5)
-        return
-    
-    # Spam detection
-    current_time = datetime.now()
-    message_tracker[message.author.id].append(current_time)
-    
-    # Remove old messages outside the time window
-    message_tracker[message.author.id] = [
-        msg_time for msg_time in message_tracker[message.author.id]
-        if current_time - msg_time < timedelta(seconds=SPAM_TIME_WINDOW)
-    ]
-    
-    # Check if user is spamming
-    if len(message_tracker[message.author.id]) > SPAM_THRESHOLD:
-        print(f"DEBUG: Spam detected from {message.author.name} ({len(message_tracker[message.author.id])} msgs in {SPAM_TIME_WINDOW}s)")
-        await message.delete()
-        await message.channel.send(
-            f"{message.author.mention}, please slow down! You're sending messages too quickly.",
-            delete_after=5
-        )
-        # Clear their tracker to give them a fresh start
-        message_tracker[message.author.id] = []
-        return
     
     await bot.process_commands(message)
 
@@ -621,10 +586,9 @@ async def slash_help(interaction: discord.Interaction):
     
     embed.add_field(
         name="Features",
-        value="✅ Bad word detection\n"
-              "✅ Spam prevention\n"
-              "✅ Contest registration\n"
-              "✅ Daily AI tips",
+      value="✅ Bad word detection\n"
+          "✅ Contest registration\n"
+          "✅ Daily server stats",
         inline=False
     )
     
@@ -1289,180 +1253,6 @@ async def daily_stats_update():
             embed.add_field(name="Total Messages", value=str(total_messages), inline=True)
             
             await stats_channel.send(embed=embed)
-
-@tasks.loop(hours=6)
-async def motivation_and_tips():
-    """Every 6 hours: Post EITHER a tip OR inspiration (alternates)"""
-    tips = [
-        # Validation & Testing
-        "💡 **Tip**: Always validate your models with cross-validation!",
-        "🧪 **A/B Testing**: Always test your assumptions with real data!",
-        "🎯 **Baseline First**: Always establish a simple baseline before trying complex models!",
-        
-        # Feature Engineering
-        "🚀 **Did you know?** Feature engineering can boost your model's performance more than switching algorithms!",
-        "🎨 **Feature Selection**: Remove irrelevant features - they just add noise!",
-        "🌐 **Data Collection**: More quality data beats a better algorithm every time!",
-        
-        # Learning & Practice
-        "📚 **Learning Tip**: Read at least one AI research paper this week!",
-        "🎯 **Challenge**: Try implementing a model from scratch without using libraries!",
-        "� **Practice**: Spend 30 minutes daily on coding challenges to improve your skills!",
-        "🎓 **Study Goal**: Master one new ML algorithm every week!",
-        "� **Read Code**: Reading others' code teaches you more than tutorials!",
-        "🎓 **Continuous Learning**: AI evolves fast - dedicate time weekly to learn new techniques!",
-        
-        # Deep Learning
-        "🧠 **Fact**: Neural networks are inspired by the human brain's structure!",
-        "🧠 **Deep Learning**: More layers ≠ better results. Start simple, then add complexity!",
-        "💡 **Transfer Learning**: Don't train from scratch when pretrained models exist!",
-        "⚡ **Batch Size**: Larger batches train faster but smaller batches generalize better!",
-        
-        # Optimization
-        "⚡ **Quick Tip**: Use early stopping to prevent overfitting in your models!",
-        "📈 **Learning Rate**: Too high and you overshoot, too low and you never converge. Find the balance!",
-        "🔥 **Hot Tip**: Normalize your inputs - it helps models converge faster!",
-        "🚀 **GPU Power**: Use cloud GPUs for heavy training - it's faster and often cheaper!",
-        
-        # Best Practices
-        "📊 **Data Insight**: 80% of data science is cleaning data, 20% is complaining about cleaning data!",
-        "� **Random Seed Tip**: Always set random seeds for reproducible results!",
-        "� **Save Often**: Save your models and checkpoints. You never know when you'll need them!",
-        "📊 **Metrics Matter**: Choose the right evaluation metric for your problem!",
-        "� **Explore Data**: Spend time understanding your data before building models!",
-        
-        # Debugging & Development
-        "🏃 **Speed Tip**: Profile your code before optimizing - don't guess where the bottleneck is!",
-        "🔍 **Debugging**: Print statements are your friend. Use them generously!",
-        "📝 **Documentation**: Future you will thank present you for writing clear comments!",
-        "🔬 **Experimentation**: Keep a log of all experiments - what worked and what didn't!",
-        
-        # Problem Solving
-        "🎯 **Focus**: Master one algorithm deeply before jumping to the next one!",
-        "🔄 **Iteration**: Your first model won't be your best. Keep iterating!",
-        "🧩 **Problem Solving**: Break complex problems into smaller, manageable pieces!",
-        "🎯 **Target Variable**: Make sure you understand what you're predicting!",
-        "💪 **Persistence**: Stuck on a bug? Take a break and come back with fresh eyes!",
-        
-        # Model Evaluation
-        "🎯 **Overfitting**: If training accuracy is 99% but validation is 60%, you're overfitting!",
-        "� **Learning Curves**: Plot them to understand if you need more data or a better model!",
-        "📊 **Bias-Variance**: Understanding this tradeoff is key to better models!",
-        "📊 **Data Leakage**: Watch out for it - it's the silent killer of ML models!",
-        
-        # Tools & Techniques
-        "🎨 **Visualization Tip**: A good plot can reveal insights that numbers alone cannot!",
-        "� **Experiment**: Try different hyperparameters - sometimes small changes make big differences!",
-        "🌟 **Ensemble Magic**: Combining multiple models often beats a single perfect model!",
-        "🔧 **Tool Tip**: Learn pandas, numpy, and matplotlib well - they're your foundation!",
-        
-        # Kaggle Specific
-        "🎓 **Kaggle Wisdom**: Learn from others' notebooks - they're full of valuable insights!",
-        "🌟 **Community**: Join ML communities - collaboration accelerates learning!",
-        "🌐 **Open Source**: Contribute to open source ML projects to learn and give back!",
-        
-        # Theory & Understanding
-        "📐 **Math Matters**: Understanding the math behind algorithms makes you a better ML practitioner!",
-        "🧠 **Intuition**: Build intuition by implementing algorithms from scratch at least once!",
-        "🌟 **Remember**: The best model is the one that solves the problem, not the most complex one!",
-        
-        # Additional Tips
-        "🔄 **Cross-Validation**: K-fold is your best friend for small datasets!",
-        "📊 **Imbalanced Data**: Don't ignore class imbalance - use SMOTE or weighted loss!",
-        "🎯 **Precision vs Recall**: Know when to optimize for which metric!",
-        "🧪 **Hyperparameter Tuning**: Use grid search or random search, but understand what you're tuning!",
-        "📈 **Gradient Descent**: Understanding optimization is key to training better models!",
-        "🎨 **Data Augmentation**: Especially powerful for image and text data!",
-        "� **Regularization**: L1, L2, dropout - know when to use each!",
-        "🔍 **EDA First**: Exploratory Data Analysis reveals patterns models might miss!",
-        "🎯 **Test Set**: Never touch it until final evaluation - it's your ground truth!",
-        "📊 **Confusion Matrix**: It tells you more than accuracy alone ever will!",
-        "🚀 **Batch Normalization**: Speeds up training and improves stability!",
-        "🧠 **Attention Mechanisms**: They revolutionized NLP and are spreading everywhere!",
-        "📈 **Loss Function**: Choose wisely - MSE for regression, cross-entropy for classification!",
-        "🎯 **Outliers**: Detect them, understand them, decide whether to remove them!",
-        "💾 **Version Control**: Git your models and experiments, not just code!",
-        "� **Reproducibility**: Document everything - seeds, versions, environment!",
-        "🎨 **Feature Scaling**: StandardScaler, MinMaxScaler - know the difference!",
-        "📊 **ROC-AUC**: Great for binary classification, but understand its limitations!",
-        "🧪 **Train-Val-Test Split**: 60-20-20 or 70-15-15, but keep it consistent!",
-        "🎯 **Early Signs**: Monitor validation loss - divergence from training is a red flag!",
-        "🚀 **Parallel Processing**: Use joblib or multiprocessing for CPU-heavy tasks!",
-        "📈 **Gradient Clipping**: Prevents exploding gradients in RNNs and deep networks!",
-        "🧠 **Activation Functions**: ReLU is good, but try Leaky ReLU or GELU too!",
-        "� **Dimensionality Reduction**: PCA and t-SNE are powerful visualization tools!"
-    ]
-    
-    
-    # Inspirational quotes
-    inspirations = [
-        "🌟 **Motivation**: Every Kaggle Grandmaster started as a beginner. Keep learning!",
-        "� **Andrew Ng**: 'AI is the new electricity' - It's transforming every industry!",
-        "🔥 **Geoffrey Hinton**: 'Deep learning is going to be able to do everything'",
-        "🎯 **Inspiration**: Your first 100 models will be terrible. Build them anyway!",
-        "🌟 **Wisdom**: The difference between a beginner and expert is that the expert has failed more times!",
-        "💡 **Yann LeCun**: 'The most important thing in AI is not to be afraid of making mistakes'",
-        "🚀 **Growth Mindset**: Every error message is a learning opportunity in disguise!",
-        "🎓 **Success Formula**: Consistency beats intensity. Code a little every day!",
-        "🔥 **Remember**: You don't need a PhD to make an impact in AI!",
-        "💪 **Perseverance**: That bug you've been fighting? Solving it will make you 10x better!",
-        "🌟 **Yoshua Bengio**: 'Be patient with yourself. Learning takes time'",
-        "🎯 **Achievement**: You're competing with who you were yesterday, not others!",
-        "🚀 **Vision**: The models you build today could change someone's life tomorrow!",
-        "� **Innovation**: The best AI solutions come from understanding the problem, not the algorithm!",
-        "🔥 **Demis Hassabis**: 'AI is a tool to amplify human creativity and ingenuity'",
-        "🌟 **Mindset**: Imposter syndrome means you're challenging yourself. That's growth!",
-        "💪 **Community**: Share your failures, not just successes. Others learn from both!",
-        "🎓 **Kaiming He**: 'Simple ideas often lead to the most significant breakthroughs'",
-        "🚀 **Progress**: Six months of consistent learning will put you ahead of 90% of beginners!",
-        "🔥 **Reminder**: AI doesn't replace jobs, it replaces tasks. Learn to use it!",
-        "💡 **Fei-Fei Li**: 'We need to make AI more human, not make humans more like AI'",
-        "🌟 **Perspective**: That Kaggle bronze medal? It's better than 75% of participants!",
-        "🎯 **Focus**: Master the fundamentals - they'll serve you for decades!",
-        "💪 **Resilience**: Model didn't converge? Try again. That's what separates winners from quitters!",
-        "🚀 **Ian Goodfellow**: 'The best way to learn deep learning is to do deep learning'",
-        "� **Truth**: Your 'bad' model taught you more than reading 10 tutorials would!",
-        "🌟 **Inspiration**: AGI might be years away, but YOUR breakthrough could happen today!",
-        "� **Sebastian Thrun**: 'AI will enable us to solve problems we didn't even know we had'",
-        "🎓 **Learning**: You don't need to know everything. You need to know where to find everything!",
-        "🚀 **Momentum**: Small daily improvements compound into extraordinary results!",
-        "🔥 **Jeff Dean**: 'Build systems that learn from data, not just rules'",
-        "💪 **Courage**: That competition you're nervous about? Enter it. Learn by doing!",
-        "🌟 **Sam Altman**: 'The best way to predict the future is to invent it'",
-        "🎯 **Reality Check**: Nobody writes perfect code on the first try. Iteration is the game!",
-        "🚀 **Purpose**: Use AI to solve real problems, not just to chase leaderboards!",
-        "💡 **Judea Pearl**: 'Data is profoundly dumb. You need intelligence to extract wisdom'",
-        "🔥 **Achievement Unlocked**: Every model you deploy is a step toward mastery!",
-        "🌟 **Community Spirit**: The AI community is collaborative, not competitive. Ask for help!",
-        "💪 **Peter Norvig**: 'Learn from everyone, compete with no one'",
-        "🎓 **Long Game**: AI is a marathon, not a sprint. Pace yourself and enjoy the journey!",
-        "🚀 **Impact**: Your beginner project today could inspire the next breakthrough tomorrow!",
-        "� **Andrej Karpathy**: 'The best way to learn is to teach'",
-        "💡 **Transformation**: Every line of code you write is an investment in your future!",
-        "🌟 **Belief**: If others can become ML engineers, so can you. It's determination, not talent!",
-        "� **François Chollet**: 'Intelligence is the ability to learn, not what you already know'",
-        "💪 **Validation**: Your code works? Great! It doesn't? Even better - you're learning!",
-        "🚀 **Momentum**: The hardest part is starting. You've already done that!",
-        "🔥 **Lex Fridman**: 'Fall in love with the process, not just the outcome'",
-        "🌟 **Growth**: Six months ago, this problem would have seemed impossible. Look at you now!",
-        "💡 **Remember**: Every expert was once a beginner who refused to give up!"
-    ]
-    
-    # Combine tips and inspirations
-    all_messages = tips + inspirations
-    
-    for guild in bot.guilds:
-        # Use configured TIPS_CHANNEL_ID, fallback to searching for "general" or first channel
-        if TIPS_CHANNEL_ID:
-            channel = bot.get_channel(TIPS_CHANNEL_ID)
-        else:
-            channel = discord.utils.get(guild.text_channels, name="general")
-            if not channel:
-                channel = guild.text_channels[0] if guild.text_channels else None
-        
-        if channel:
-            message = random.choice(all_messages)
-            await channel.send(message)
 
 # ===== HELPER FUNCTIONS =====
 
